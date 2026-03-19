@@ -3,16 +3,13 @@
 ds_store_parser.py - macOS .DS_Store file parser for forensic analysis.
 
 Parses the binary .DS_Store format (Bud1 buddy allocator + B-tree) and
-extracts all Finder metadata records with human-readable interpretation.
-
-Output: CSV or JSON with columns:
-  filename, record_type, data_type, value, detail
+outputs one row per file/folder with human-readable columns. Raw record
+data is preserved in the last column for advanced analysis.
 
 Usage:
   python3 ds_store_parser.py <.DS_Store file>
   python3 ds_store_parser.py -o output.csv <.DS_Store file>
   python3 ds_store_parser.py --json <.DS_Store file>
-  python3 ds_store_parser.py --raw <.DS_Store file>   # include hex blobs
 """
 
 from __future__ import annotations
@@ -25,6 +22,8 @@ import plistlib
 import struct
 import sys
 import warnings
+import os
+from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 
@@ -599,56 +598,194 @@ class DSStoreParser:
 
 
 # ---------------------------------------------------------------------------
+# Collate records into analyst-friendly rows (one per file/folder)
+# ---------------------------------------------------------------------------
+
+# Property codes that indicate this entry is a folder (has Finder window/view settings)
+FOLDER_INDICATORS = {"bwsp", "icvp", "lsvp", "lsvP", "lsvC", "vstl", "fwi0", "fwsw",
+                     "fwvh", "icvt", "lsvt", "BKGD", "pict", "icvo", "lsvo", "dscl"}
+
+ANALYST_COLUMNS = [
+    "path",
+    "name",
+    "type",
+    "logical_size",
+    "logical_size_bytes",
+    "physical_size",
+    "physical_size_bytes",
+    "modification_date",
+    "was_on_desktop",
+    "icon_location",
+    "view_style",
+    "folder_window_bounds",
+    "spotlight_comment",
+    "trash_original_name",
+    "trash_original_path",
+    "expanded_in_list_view",
+    "raw_records",
+]
+
+
+def _extract_timestamp(rec: DSStoreRecord) -> str:
+    """Extract an ISO timestamp from a modD/moDD record."""
+    val = rec.raw_value
+    if isinstance(val, bytes):
+        dt = cfabstime_to_datetime(val)
+        if dt:
+            return dt.isoformat()
+    elif isinstance(val, int):
+        dt = dutc_to_datetime(val)
+        if dt:
+            return dt.isoformat()
+    return ""
+
+
+def _extract_window_bounds(rec: DSStoreRecord) -> str:
+    """Extract just the window bounds string from a bwsp plist blob."""
+    if not isinstance(rec.raw_value, bytes):
+        return ""
+    plist = try_decode_plist(rec.raw_value)
+    if isinstance(plist, dict) and "WindowBounds" in plist:
+        return str(plist["WindowBounds"])
+    return ""
+
+
+def _extract_view_style(rec: DSStoreRecord) -> str:
+    """Extract view style name from a vstl record."""
+    if isinstance(rec.raw_value, str):
+        return VIEW_STYLES.get(rec.raw_value, rec.raw_value)
+    return ""
+
+
+def _raw_record_summary(rec: DSStoreRecord) -> dict:
+    """Compact dict for stashing in the raw_records column."""
+    value_str, _ = interpret_record(rec)
+    entry: dict = {"code": rec.property_code, "type": rec.data_type, "value": value_str}
+    if isinstance(rec.raw_value, bytes):
+        entry["hex"] = rec.raw_value.hex()
+    return entry
+
+
+def collate_records(
+    records: list[DSStoreRecord],
+    ds_store_path: str,
+) -> list[dict]:
+    """Group raw records by filename and produce one analyst row per entry."""
+    parent_dir = os.path.dirname(os.path.abspath(ds_store_path))
+
+    # Group records by filename
+    grouped: dict[str, list[DSStoreRecord]] = defaultdict(list)
+    for rec in records:
+        grouped[rec.filename].append(rec)
+
+    rows = []
+    for filename, recs in grouped.items():
+        codes = {r.property_code for r in recs}
+
+        # Determine type
+        if filename == ".":
+            entry_type = "this directory"
+        elif codes & FOLDER_INDICATORS:
+            entry_type = "folder"
+        elif codes & {"dilc", "extn", "Iloc", "ptbN", "ptbL"}:
+            entry_type = "file"
+        else:
+            # Has size/date metadata but no folder indicators - likely a file or
+            # folder that was only seen in a parent listing, not opened in Finder
+            entry_type = "file or folder"
+
+        # Build full path
+        if filename == ".":
+            full_path = parent_dir
+        else:
+            full_path = os.path.join(parent_dir, filename)
+
+        row: dict = {
+            "path": full_path,
+            "name": filename if filename != "." else os.path.basename(parent_dir),
+            "type": entry_type,
+            "logical_size": "",
+            "logical_size_bytes": "",
+            "physical_size": "",
+            "physical_size_bytes": "",
+            "modification_date": "",
+            "was_on_desktop": "",
+            "icon_location": "",
+            "view_style": "",
+            "folder_window_bounds": "",
+            "spotlight_comment": "",
+            "trash_original_name": "",
+            "trash_original_path": "",
+            "expanded_in_list_view": "",
+            "raw_records": "",
+        }
+
+        raw_all = []
+        for rec in recs:
+            raw_all.append(_raw_record_summary(rec))
+
+            match rec.property_code:
+                case "lg1S" | "logS" if isinstance(rec.raw_value, int):
+                    row["logical_size"] = format_size(rec.raw_value)
+                    row["logical_size_bytes"] = str(rec.raw_value)
+                case "ph1S" | "phyS" if isinstance(rec.raw_value, int):
+                    row["physical_size"] = format_size(rec.raw_value)
+                    row["physical_size_bytes"] = str(rec.raw_value)
+                case "modD" | "moDD":
+                    ts = _extract_timestamp(rec)
+                    if ts and not row["modification_date"]:
+                        row["modification_date"] = ts
+                case "dilc":
+                    row["was_on_desktop"] = "yes"
+                case "Iloc" if isinstance(rec.raw_value, bytes) and len(rec.raw_value) >= 8:
+                    x, y = struct.unpack(">II", rec.raw_value[:8])
+                    row["icon_location"] = f"{x},{y}"
+                case "vstl":
+                    row["view_style"] = _extract_view_style(rec)
+                case "bwsp":
+                    bounds = _extract_window_bounds(rec)
+                    if bounds:
+                        row["folder_window_bounds"] = bounds
+                case "cmmt" if isinstance(rec.raw_value, str):
+                    row["spotlight_comment"] = rec.raw_value
+                case "ptbN" if isinstance(rec.raw_value, str):
+                    row["trash_original_name"] = rec.raw_value
+                case "ptbL" if isinstance(rec.raw_value, (str, int)):
+                    row["trash_original_path"] = str(rec.raw_value)
+                case "dscl":
+                    row["expanded_in_list_view"] = str(bool(rec.raw_value))
+
+        row["raw_records"] = json.dumps(raw_all, ensure_ascii=False)
+        rows.append(row)
+
+    return rows
+
+
+# ---------------------------------------------------------------------------
 # Output Formatting
 # ---------------------------------------------------------------------------
 
-def records_to_csv(
-    records: list[DSStoreRecord],
-    output: io.TextIOBase,
-    include_raw: bool = False,
-) -> None:
-    """Write records as CSV."""
-    fieldnames = ["filename", "record_type", "data_type", "value", "detail"]
-    if include_raw:
-        fieldnames.append("raw_hex")
-
-    writer = csv.writer(output)
-    writer.writerow(fieldnames)
-
-    for rec in records:
-        value_str, detail_str = interpret_record(rec)
-        row = [rec.filename, rec.property_code, rec.data_type, value_str, detail_str]
-        if include_raw:
-            if isinstance(rec.raw_value, bytes):
-                row.append(rec.raw_value.hex())
-            elif isinstance(rec.raw_value, int) and rec.data_type == "dutc":
-                row.append(f"{rec.raw_value:016x}")
-            else:
-                row.append("")
-        writer.writerow(row)
+def write_analyst_csv(rows: list[dict], output: io.TextIOBase) -> None:
+    """Write analyst-friendly CSV (one row per file/folder)."""
+    writer = csv.DictWriter(output, fieldnames=ANALYST_COLUMNS)
+    writer.writeheader()
+    writer.writerows(rows)
 
 
-def records_to_json(
-    records: list[DSStoreRecord],
-    output: io.TextIOBase,
-    include_raw: bool = False,
-) -> None:
-    """Write records as JSON."""
-    entries = []
-    for rec in records:
-        value_str, detail_str = interpret_record(rec)
-        entry = {
-            "filename": rec.filename,
-            "record_type": rec.property_code,
-            "data_type": rec.data_type,
-            "value": value_str,
-            "detail": detail_str,
-        }
-        if include_raw and isinstance(rec.raw_value, bytes):
-            entry["raw_hex"] = rec.raw_value.hex()
-        entries.append(entry)
-
-    json.dump(entries, output, indent=2, ensure_ascii=False)
+def write_analyst_json(rows: list[dict], output: io.TextIOBase) -> None:
+    """Write analyst-friendly JSON."""
+    # Parse raw_records back from string so it nests properly in JSON
+    clean = []
+    for row in rows:
+        entry = dict(row)
+        try:
+            entry["raw_records"] = json.loads(row["raw_records"])
+        except (json.JSONDecodeError, TypeError):
+            pass
+        # Strip empty string fields for cleaner output
+        entry = {k: v for k, v in entry.items() if v != ""}
+        clean.append(entry)
+    json.dump(clean, output, indent=2, ensure_ascii=False)
     output.write("\n")
 
 
@@ -659,17 +796,11 @@ def records_to_json(
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Parse macOS .DS_Store files and extract forensic metadata.",
-        epilog="Outputs CSV by default. Use --json for JSON output.",
     )
     parser.add_argument("input", help="path to .DS_Store file")
     parser.add_argument(
         "-o", "--output",
         help="output file path (default: stdout)",
-    )
-    parser.add_argument(
-        "--raw",
-        action="store_true",
-        help="include raw hex column for blob values",
     )
     parser.add_argument(
         "--json",
@@ -699,6 +830,9 @@ def main() -> None:
         print(f"error: failed to parse '{args.input}': {e}", file=sys.stderr)
         sys.exit(1)
 
+    # Collate into analyst-friendly rows
+    analyst_rows = collate_records(records, args.input)
+
     # Output
     if args.output:
         out = open(args.output, "w", newline="", encoding="utf-8")
@@ -707,9 +841,9 @@ def main() -> None:
 
     try:
         if args.use_json:
-            records_to_json(records, out, include_raw=args.raw)
+            write_analyst_json(analyst_rows, out)
         else:
-            records_to_csv(records, out, include_raw=args.raw)
+            write_analyst_csv(analyst_rows, out)
     finally:
         if args.output:
             out.close()

@@ -31,70 +31,53 @@ Key locations to check:
 python3 ds_store_parser.py <.DS_Store file>
 python3 ds_store_parser.py -o output.csv <.DS_Store file>
 python3 ds_store_parser.py --json <.DS_Store file>
-python3 ds_store_parser.py --raw <.DS_Store file>
 ```
 
 | Flag | Description |
 |------|-------------|
 | `-o FILE` | Write output to file instead of stdout |
 | `--json` | Output JSON instead of CSV |
-| `--raw` | Add a `raw_hex` column with hex-encoded blob data |
 
 A summary line prints to stderr: `parsed N records for M files/directories`
 
 ## Output format
 
-CSV columns (or JSON keys):
+The output has **one row per file or folder** referenced in the `.DS_Store`. Each row consolidates all the raw binary records for that entry into human-readable columns.
 
-| Column | Description |
-|--------|-------------|
-| `filename` | The file or directory name this record describes (`.` = the directory itself) |
-| `record_type` | 4-character property code (see table below) |
-| `data_type` | Storage type: `blob`, `long`, `comp`, `bool`, `ustr`, `type`, `shor`, `dutc` |
-| `value` | Parsed, human-readable value |
-| `detail` | What the property means |
+| Column | What it tells you |
+|--------|-------------------|
+| `path` | Full filesystem path of the file/folder (inferred from the .DS_Store location) |
+| `name` | Filename or folder name |
+| `type` | `file`, `folder`, `this directory` (the folder the .DS_Store lives in), or `file or folder` (ambiguous - Finder indexed it but never opened it) |
+| `logical_size` | Human-readable file/folder size (e.g. `152.1 GB`) |
+| `logical_size_bytes` | Exact size in bytes |
+| `physical_size` | Disk space used (accounts for block size overhead) |
+| `physical_size_bytes` | Exact physical size in bytes |
+| `modification_date` | ISO 8601 timestamp of when Finder last recorded the modification date |
+| `was_on_desktop` | `yes` if this item had a desktop icon position stored |
+| `icon_location` | Finder icon x,y coordinates |
+| `view_style` | How Finder displayed this folder: `icon view`, `list view`, `column view`, `gallery view` |
+| `folder_window_bounds` | Finder window position/size when this folder was open |
+| `spotlight_comment` | User-set Spotlight comment text |
+| `trash_original_name` | If this file was trashed: what it was originally called |
+| `trash_original_path` | If this file was trashed: the directory it lived in before deletion |
+| `expanded_in_list_view` | Whether this subfolder was expanded in its parent's list view |
+| `raw_records` | JSON array of all raw parsed records for this entry (property codes, types, values, hex data) |
 
-## Record types
+### How to read the type column
 
-### Forensically significant
+- **`file`** - This was a file (had an icon position, desktop placement, extension, or trash record)
+- **`folder`** - This was a folder that someone opened in Finder (it has window/view settings like window bounds, icon size, view style)
+- **`this directory`** - Metadata about the directory the `.DS_Store` file lives in (its own window settings)
+- **`file or folder`** - Finder recorded size/date metadata for this entry (from a parent directory listing) but it was never opened, so we can't tell if it's a file or folder
 
-| Code | Description | Example value |
-|------|-------------|---------------|
-| `ptbN` | Original filename before Trash | `report.pdf` |
-| `ptbL` | Original directory path before Trash | `System/Volumes/Data/Users/john/Desktop/` |
-| `modD` / `moDD` | Modification timestamp (CFAbsoluteTime) | `2024-11-09T23:03:44.260570+00:00` |
-| `lg1S` / `logS` | Logical file size | `163368089342 (152.1 GB)` |
-| `ph1S` / `phyS` | Physical file size | `163385491456 (152.2 GB)` |
+### Interpreting the trash columns
 
-### File/directory display
+When a file is moved to Trash via Finder, the `.DS_Store` may record:
+- `trash_original_name`: The file's name before it was trashed (it may have been renamed, e.g. a screenshot renamed to something shorter)
+- `trash_original_path`: The full directory path where the file lived before deletion (e.g. `System/Volumes/Data/Users/john/Desktop/`)
 
-| Code | Description | Example value |
-|------|-------------|---------------|
-| `Iloc` | Icon position | `x=340, y=252` |
-| `dilc` | Desktop icon position | `x=0, y=65536 (+desktop flags)` |
-| `vstl` | View style | `icon view`, `list view`, `column view`, `gallery view` |
-| `dscl` | Expanded in list view | `True` / `False` |
-| `cmmt` | Spotlight comment | free text |
-| `extn` | File extension | `pdf` |
-
-### Window/view settings
-
-| Code | Description |
-|------|-------------|
-| `bwsp` | Window size, position, toolbar/sidebar state (decoded plist) |
-| `fwi0` | Legacy Finder window rect + view type |
-| `fwsw` | Sidebar width in pixels |
-| `fwvh` | Window height |
-| `icvp` | Icon view settings: icon size, grid, background, sort (decoded plist) |
-| `icvt` | Icon view text size in points |
-| `lsvp` / `lsvP` / `lsvC` | List view settings: columns, widths, sort order (decoded plist) |
-| `lsvt` | List view text size in points |
-| `BKGD` | Background type: `default`, `color: rgb(R,G,B)`, or `picture` |
-| `pBBk` | Bookmark data blob |
-| `pict` | Background picture alias record |
-| `vSrn` | Version indicator (always `1`) |
-| `ICVO` / `LSVO` | Icon/list view options enabled flag |
-| `icgo` / `icsp` / `lssp` | Icon options, scroll positions |
+These records can persist even after the Trash is emptied (until reboot), making them valuable for proving a file existed and was intentionally deleted.
 
 ## Testing and validation
 
@@ -115,3 +98,4 @@ Validation covered:
 3. **B-tree** - locates the root node via the `DSDB` TOC entry, then recursively traverses internal and leaf nodes
 4. **Records** - each B-tree entry contains a UTF-16BE filename, a 4-byte property code, a 4-byte type tag, and a type-dependent payload
 5. **Interpretation** - timestamps are decoded from CFAbsoluteTime (float64 seconds since 2001-01-01), embedded binary plists are expanded, sizes are formatted, coordinates are extracted
+6. **Collation** - multiple raw records for the same filename are grouped into a single row with clear column names
